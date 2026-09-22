@@ -1,0 +1,15 @@
+Node-or-ALL    VLAN    ZONE
+proxmox01      none    UNINS-PLS-168.100/24
+proxmox        none    UNINS-PLS-168.100/24
+prox01dc       none    UNINS-PLS-168.100/24
+proxmox-05     none    UNINS-PLS-168.100/24
+ALL            30      UNINS-PLS-168.100/24
+ALL            103     UNINS-PLS-168.103/24
+ALL            106     UNINS-PLS-168.106/24
+ALL            810     TRUST-ISGLOBAL_200.0/27
+ALL            811     UNOUT-INET_200.32/29
+ALL            812     UNINS-E2TEAM_200.40/29
+ALL            813     UNINS-E2TEAM_200.48/29
+ALL            814     UNINS-E2TEAM_200.52/30
+ALL            815     TRUST-ISGLOBAL_200.56/29
+ALL            98      ISOLATED-LAB-CNB-98
