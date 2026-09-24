@@ -3,9 +3,12 @@ import urllib3
 import re
 import json
 import os
+import glob
+import math
 from datetime import datetime
 import pandas as pd
-from openpyxl.styles import Border, Side, Alignment, PatternFill
+from openpyxl import load_workbook
+from openpyxl.styles import Border, Side, Alignment, PatternFill, Font
 
 # Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -150,6 +153,353 @@ def write_bordered_row(ws, row, col, key, val, thin_border):
     c1.border = thin_border
     c2.border = thin_border
 
+
+# =====================================================================
+#  CHANGE TRACKING / HISTORY
+# =====================================================================
+RESULT_DIR = "result"
+
+# VM columns compared between runs. "Uptime" is excluded on purpose (it changes
+# every run) and is only used for reboot detection.
+VM_COMPARE_FIELDS = ["Name", "State", "IP_Address", "OS", "CPU", "Memory_GB",
+                     "VLAN", "ZONE", "Harddisks", "HD_Total_GB", "Notes"]
+# These are only reliable while the guest is running (a stopped VM reports
+# IP "None" and falls back to the ostype), so they are compared only when the
+# VM is RUNNING in both results.
+VM_RUNNING_ONLY_FIELDS = {"IP_Address", "OS"}
+
+# Node fields that describe the hardware / software of the host.
+NODE_COMPARE_FIELDS = ["CPU_Total", "RAM_Total_GB", "CPU_Info", "Kernel_Version",
+                       "Boot_Mode", "Manager_Version",
+                       "Local_Storage_Total_GB", "Shared_Storage_Total_GB"]
+# Storage utilisation is logged only when it moves by at least this many
+# percentage points (set to None to disable).
+STORAGE_UTIL_THRESHOLD = 5.0
+
+HISTORY_COLUMNS = ["Detected_At", "Compared_With", "Category", "Change_Type", "Node",
+                   "VMID", "Name", "Field", "Old_Value", "New_Value", "Details"]
+
+CHANGE_COLORS = {
+    "NEW": "C6EFCE", "NODE_ADDED": "C6EFCE",
+    "DELETED": "FFC7CE", "NODE_REMOVED": "FFC7CE",
+    "MOVED": "BDD7EE",
+    "MODIFIED": "FFEB9C", "NODE_MODIFIED": "FFEB9C",
+    "REBOOTED": "E4DFEC",
+    "NODE_UNREACHABLE": "F8CBAD", "UNVERIFIED": "F8CBAD",
+    "NO_CHANGE": "EDEDED", "BASELINE": "EDEDED",
+}
+
+
+def _parse_result_timestamp(path):
+    """Get the run time from the file name (both old and new naming), else mtime."""
+    stem = os.path.splitext(os.path.basename(path))[0].replace("vm_list_", "", 1)
+    for fmt in ("%Y-%m-%d_%H-%M", "%Y-%m-%d-%H", "%Y-%m-%d_%H-%M-%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(stem, fmt)
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(os.path.getmtime(path))
+
+
+def list_previous_results(exclude_path=None):
+    """All vm_list_*.xlsx in the result directory, newest first."""
+    files = [f for f in glob.glob(os.path.join(RESULT_DIR, "vm_list_*.xlsx"))
+             if not os.path.basename(f).startswith("~$")]      # skip Excel lock files
+    if exclude_path:
+        files = [f for f in files if os.path.abspath(f) != os.path.abspath(exclude_path)]
+    return sorted(files, key=_parse_result_timestamp, reverse=True)
+
+
+def _norm(value, field=None):
+    """Normalise a value so in-memory data and data read back from Excel compare equal."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return str(int(f)) if f.is_integer() else str(round(f, 2))
+    s = str(value).strip().replace("\r\n", "\n")
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return _norm(float(s))
+    if field in ("IP_Address", "VLAN", "ZONE"):
+        # Order of IPs / NICs is not meaningful
+        s = ", ".join(sorted(p.strip() for p in s.split(",") if p.strip()))
+    return s
+
+
+def read_previous_vms(filepath):
+    """Read the 'VM Inventory' sheet of a previous result into {Key: row_dict}."""
+    try:
+        df = pd.read_excel(filepath, sheet_name="VM Inventory", keep_default_na=False)
+    except ValueError:          # sheet does not exist
+        return {}
+    except Exception as e:
+        print(f"Warning: could not read VM Inventory from '{filepath}': {e}")
+        return {}
+    vms = {}
+    for row in df.to_dict("records"):
+        key = str(row.get("Key", "")).strip() or f"{row.get('Node')}_{row.get('VMID')}"
+        vms[key] = row
+    return vms
+
+
+def read_previous_nodes(filepath, known_fields):
+    """
+    Parse the 'Node Information' sheet (custom layout) back into {node: {field: value}}.
+    Node headers are in column A as "<n> <node>"; key/value pairs sit in
+    columns B/C, C/D and E/F.
+    """
+    try:
+        wb = load_workbook(filepath, read_only=True, data_only=True)
+    except Exception as e:
+        print(f"Warning: could not open '{filepath}': {e}")
+        return {}
+    if "Node Information" not in wb.sheetnames:
+        wb.close()
+        return {}
+    nodes, current = {}, None
+    for row in wb["Node Information"].iter_rows(values_only=True):
+        row = list(row) + [None] * 6
+        if row[0] is not None and str(row[0]).strip():
+            header = str(row[0]).strip()
+            current = header.split(" ", 1)[1] if " " in header else header
+            nodes[current] = {}
+            continue
+        if current is None:
+            continue
+        for k_idx in (1, 2, 4):          # key columns B, C, E (0-based)
+            key = row[k_idx]
+            if isinstance(key, str) and key in known_fields:
+                nodes[current][key] = row[k_idx + 1]
+    wb.close()
+    return nodes
+
+
+def read_previous_history(filepath):
+    """Carry forward the History sheet so it accumulates across runs."""
+    try:
+        df = pd.read_excel(filepath, sheet_name="History", keep_default_na=False, dtype=str)
+        df = df.reindex(columns=HISTORY_COLUMNS, fill_value="")
+        df["VMID"] = df["VMID"].apply(lambda x: int(x) if str(x).isdigit() else x)
+        return df
+    except ValueError:
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    except Exception as e:
+        print(f"Warning: could not read History from '{filepath}': {e}")
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+def _vm_field_changes(old, new, skip=()):
+    """List of (field, old, new) for fields that differ between two VM records."""
+    changes = []
+    both_running = (_norm(old.get("State")) == "RUNNING" and _norm(new.get("State")) == "RUNNING")
+    for field in VM_COMPARE_FIELDS:
+        if field in skip:
+            continue
+        if field in VM_RUNNING_ONLY_FIELDS and not both_running:
+            continue
+        o, n = _norm(old.get(field), field), _norm(new.get(field), field)
+        if o != n:
+            changes.append((field, old.get(field, ""), new.get(field, "")))
+    return changes
+
+
+def compare_vms(prev_vms, curr_vms, unreachable_nodes):
+    """
+    Compare previous and current VM inventories.
+    Returns a list of change dicts (without the Detected_At / Compared_With columns).
+    """
+    changes = []
+    old_left = dict(prev_vms)
+    new_left = {r["Key"]: r for r in curr_vms}
+
+    def rec(ctype, row, field="", old="", new="", details=""):
+        changes.append({"Category": "VM", "Change_Type": ctype,
+                        "Node": row.get("Node", ""), "VMID": row.get("VMID", ""),
+                        "Name": row.get("Name", ""), "Field": field,
+                        "Old_Value": old, "New_Value": new, "Details": details})
+
+    def compare_pair(old, new, moved):
+        if moved:
+            rec("MOVED", new, "Node/VMID",
+                f"{old.get('Node')} / {old.get('VMID')}",
+                f"{new.get('Node')} / {new.get('VMID')}",
+                f"Moved from {old.get('Node')} ({old.get('NodeIP')}) "
+                f"to {new.get('Node')} ({new.get('NodeIP')})")
+        for field, o, n in _vm_field_changes(old, new):
+            rec("MODIFIED", new, field, o, n)
+        # Reboot detection: running in both results but uptime went down
+        try:
+            if (_norm(old.get("State")) == "RUNNING" and _norm(new.get("State")) == "RUNNING"
+                    and float(new.get("Uptime") or 0) < float(old.get("Uptime") or 0)):
+                rec("REBOOTED", new, "Uptime", old.get("Uptime"), new.get("Uptime"),
+                    "Uptime decreased since previous result")
+        except (TypeError, ValueError):
+            pass
+
+    # Pass 1: same node + same VMID
+    for key in list(new_left):
+        if key in old_left:
+            compare_pair(old_left.pop(key), new_left.pop(key), moved=False)
+
+    # Pass 2: moved with same VMID + same name (e.g. cluster migration)
+    for nkey, new in list(new_left.items()):
+        for okey, old in list(old_left.items()):
+            if (_norm(old.get("VMID")) == _norm(new.get("VMID"))
+                    and _norm(old.get("Name")) == _norm(new.get("Name"))):
+                compare_pair(old_left.pop(okey), new_left.pop(nkey), moved=True)
+                break
+
+    # Pass 3: moved with a different VMID -> match by name if unique on both sides
+    def names(d):
+        out = {}
+        for k, r in d.items():
+            n = _norm(r.get("Name"))
+            if n and n.lower() != "unknown":
+                out.setdefault(n, []).append(k)
+        return out
+    old_names, new_names = names(old_left), names(new_left)
+    for name, nkeys in new_names.items():
+        okeys = old_names.get(name, [])
+        if len(nkeys) == 1 and len(okeys) == 1:
+            compare_pair(old_left.pop(okeys[0]), new_left.pop(nkeys[0]), moved=True)
+
+    # Remaining = deleted / new
+    for old in old_left.values():
+        if old.get("Node") in unreachable_nodes:
+            rec("UNVERIFIED", old, details=f"Node {old.get('Node')} was unreachable; "
+                                           f"cannot confirm whether this guest still exists")
+        else:
+            rec("DELETED", old, details=f"Was on {old.get('Node')} ({old.get('NodeIP')}), "
+                                        f"state {old.get('State')}")
+    for new in new_left.values():
+        rec("NEW", new, details=f"Created on {new.get('Node')} ({new.get('NodeIP')}), "
+                                f"state {new.get('State')}")
+    return changes
+
+
+def compare_nodes(prev_nodes, curr_nodes, unreachable_nodes):
+    changes = []
+    curr = {n["Node"]: n for n in curr_nodes}
+
+    def rec(ctype, node, field="", old="", new="", details=""):
+        changes.append({"Category": "Node", "Change_Type": ctype, "Node": node,
+                        "VMID": "", "Name": "", "Field": field,
+                        "Old_Value": old, "New_Value": new, "Details": details})
+
+    for node, new in curr.items():
+        old = prev_nodes.get(node)
+        if old is None:
+            rec("NODE_ADDED", node, details=f"New Proxmox node ({new.get('NodeIP')})")
+            continue
+        for field in NODE_COMPARE_FIELDS:
+            if field in old and _norm(old.get(field)) != _norm(new.get(field)):
+                rec("NODE_MODIFIED", node, field, old.get(field), new.get(field))
+        if STORAGE_UTIL_THRESHOLD is not None:
+            for field in ("Local_Storage_Util_%", "Shared_Storage_Util_%"):
+                try:
+                    o, n = float(old.get(field)), float(new.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if abs(n - o) >= STORAGE_UTIL_THRESHOLD:
+                    rec("NODE_MODIFIED", node, field, o, n,
+                        f"Storage utilisation changed by {round(n - o, 2):+} points")
+
+    for node in prev_nodes:
+        if node in curr:
+            continue
+        if node in unreachable_nodes:
+            rec("NODE_UNREACHABLE", node, details="Node could not be queried in this run")
+        else:
+            rec("NODE_REMOVED", node, details="Node no longer present in servers.json / results")
+    # Nodes that were unreachable now and also absent previously
+    for node in unreachable_nodes:
+        if node not in prev_nodes and node not in curr:
+            rec("NODE_UNREACHABLE", node, details="Node could not be queried in this run")
+    return changes
+
+
+def build_history(prev_files, curr_vms, curr_nodes, unreachable_nodes, run_time):
+    """Create the History DataFrame: new changes on top, older history below."""
+    prev_file = prev_files[0] if prev_files else None
+    detected_at = run_time.strftime("%Y-%m-%d %H:%M")
+    stamp = lambda c, prev: {"Detected_At": detected_at, "Compared_With": prev, **c}
+
+    if not prev_file:
+        base = {"Category": "-", "Change_Type": "BASELINE", "Node": "", "VMID": "", "Name": "",
+                "Field": "", "Old_Value": "", "New_Value": "",
+                "Details": "No previous result found; this run is the baseline"}
+        return pd.DataFrame([stamp(base, "")], columns=HISTORY_COLUMNS), []
+
+    prev_name = os.path.basename(prev_file)
+    print(f"\nComparing with previous result: {prev_name}")
+    prev_vms = read_previous_vms(prev_file)
+    known_node_fields = set(curr_nodes[0].keys()) if curr_nodes else set(NODE_COMPARE_FIELDS)
+    known_node_fields |= set(NODE_COMPARE_FIELDS) | {"Local_Storage_Util_%", "Shared_Storage_Util_%"}
+    prev_nodes = read_previous_nodes(prev_file, known_node_fields)
+
+    # If a node is back after being unreachable (so it is missing from the previous
+    # result), use the last result in which it was present as its baseline.
+    # Otherwise all of its guests would wrongly show up as NEW.
+    for node in {n["Node"] for n in curr_nodes} - set(prev_nodes):
+        for older in prev_files[1:]:
+            older_nodes = read_previous_nodes(older, known_node_fields)
+            if node in older_nodes:
+                print(f"  Node {node} missing from {prev_name}; using {os.path.basename(older)} as its baseline")
+                prev_nodes[node] = older_nodes[node]
+                for key, row in read_previous_vms(older).items():
+                    if row.get("Node") == node and key not in prev_vms:
+                        prev_vms[key] = row
+                break
+
+    changes = compare_nodes(prev_nodes, curr_nodes, unreachable_nodes)
+    changes += compare_vms(prev_vms, curr_vms, unreachable_nodes)
+
+    if not changes:
+        changes_rows = [stamp({"Category": "-", "Change_Type": "NO_CHANGE", "Node": "",
+                               "VMID": "", "Name": "", "Field": "", "Old_Value": "",
+                               "New_Value": "", "Details": "No changes detected"}, prev_name)]
+    else:
+        changes_rows = [stamp(c, prev_name) for c in changes]
+
+    df_new = pd.DataFrame(changes_rows, columns=HISTORY_COLUMNS)
+    df_old = read_previous_history(prev_file)
+    df = pd.concat([df_new, df_old], ignore_index=True) if not df_old.empty else df_new
+    return df, changes
+
+
+def write_history_sheet(writer, df_history):
+    df_history.to_excel(writer, index=False, sheet_name="History")
+    ws = writer.sheets["History"]
+    header_fill = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.border = border
+
+    type_col = HISTORY_COLUMNS.index("Change_Type")
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        color = CHANGE_COLORS.get(str(row[type_col].value))
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        if color:
+            row[type_col].fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+
+    widths = {"Detected_At": 17, "Compared_With": 30, "Category": 9, "Change_Type": 18,
+              "Node": 14, "VMID": 7, "Name": 25, "Field": 22, "Old_Value": 35,
+              "New_Value": 35, "Details": 55}
+    for idx, col in enumerate(HISTORY_COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = widths[col]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
 def main():
     servers = load_config("servers.json")
     zone_map = load_vlan_zones("vlan-zone.txt")
@@ -157,6 +507,8 @@ def main():
     all_instances_data = []
     all_nodes_data = []
     node_summaries = {}
+    unreachable_nodes = set()
+    run_time = datetime.now()
 
     for server in servers:
         host = server['host']
@@ -170,6 +522,8 @@ def main():
         
         # --- 1. FETCH NODE LEVEL INFORMATION ---
         node_status = make_request("GET", f"{base_url}/nodes/{node}/status", headers)
+        if node_status is None:
+            unreachable_nodes.add(node)
         if node_status:
             n_cpu_total = node_status.get('cpuinfo', {}).get('cpus', 0)
             n_ram_total = round(node_status.get('memory', {}).get('total', 0) / 1073741824, 2)
@@ -302,9 +656,15 @@ def main():
         # Insert ZONE column immediately after VLAN
         df_vms = df_vms[["No", "Key", "Node", "NodeIP", "VMID", "Name", "State", "Uptime", "IP_Address", "OS", "CPU", "Memory_GB", "VLAN", "ZONE", "Harddisks", "HD_Total_GB", "Notes"]]
 
-    os.makedirs("result", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    excel_filepath = os.path.join("result", f"vm_list_{timestamp}.xlsx")
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    timestamp = run_time.strftime("%Y-%m-%d_%H-%M")
+    excel_filepath = os.path.join(RESULT_DIR, f"vm_list_{timestamp}.xlsx")
+
+    # --- Compare with the previous result (must happen before the new file is written) ---
+    prev_files = list_previous_results(exclude_path=excel_filepath)
+    prev_file = prev_files[0] if prev_files else None
+    df_history, detected_changes = build_history(prev_files, all_instances_data, all_nodes_data,
+                                                 unreachable_nodes, run_time)
     
     # --- Execute Excel Generation ---
     with pd.ExcelWriter(excel_filepath, engine='openpyxl') as writer:
@@ -388,6 +748,9 @@ def main():
                     
                 r_idx += 1
 
+        # --- History sheet (changes vs previous result) ---
+        write_history_sheet(writer, df_history)
+
     print("\n" + "="*50)
     print("PROXMOX SUMMARY")
     print("="*50)
@@ -399,6 +762,21 @@ def main():
         print(f"  - Total LXC Stopped  : {counts['LXC_Stopped']}")
         print("-" * 50)
             
+    print("CHANGES SINCE PREVIOUS RESULT")
+    print("=" * 50)
+    if not prev_file:
+        print("No previous result found - this run is the baseline.")
+    elif not detected_changes:
+        print(f"No changes compared with {os.path.basename(prev_file)}")
+    else:
+        counts = {}
+        for c in detected_changes:
+            counts[c["Change_Type"]] = counts.get(c["Change_Type"], 0) + 1
+        for ctype, cnt in sorted(counts.items()):
+            print(f"  - {ctype:<17}: {cnt}")
+        print(f"  (details in the 'History' sheet)")
+    print("-" * 50)
+
     print(f"\n[Success] Formatted data exported to: {excel_filepath}")
 
 if __name__ == "__main__":
